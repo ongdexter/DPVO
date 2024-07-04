@@ -14,7 +14,7 @@ from . import projective_ops as pops
 autocast = torch.cuda.amp.autocast
 Id = SE3.Identity(1, device="cuda")
 
-
+FMAP_DIM = 480
 class DPVO:
     def __init__(self, cfg, network, ht=480, wd=640, viz=False):
         self.cfg = cfg
@@ -60,13 +60,13 @@ class DPVO:
             self.kwargs = kwargs = {"device": "cuda", "dtype": torch.float}
         
         self.imap_ = torch.zeros(self.mem, self.M, DIM, **kwargs)
-        self.gmap_ = torch.zeros(self.mem, self.M, 128, self.P, self.P, **kwargs)
+        self.gmap_ = torch.zeros(self.mem, self.M, FMAP_DIM, self.P, self.P, **kwargs)
 
         ht = ht // RES
         wd = wd // RES
 
-        self.fmap1_ = torch.zeros(1, self.mem, 128, ht // 1, wd // 1, **kwargs)
-        self.fmap2_ = torch.zeros(1, self.mem, 128, ht // 4, wd // 4, **kwargs)
+        self.fmap1_ = torch.zeros(1, self.mem, FMAP_DIM, ht // 1, wd // 1, **kwargs)
+        self.fmap2_ = torch.zeros(1, self.mem, FMAP_DIM, ht // 4, wd // 4, **kwargs)
 
         # feature pyramid
         self.pyramid = (self.fmap1_, self.fmap2_)
@@ -96,7 +96,7 @@ class DPVO:
                 if "update.lmbda" not in k:
                     new_state_dict[k.replace('module.', '')] = v
             
-            self.network = VONet()
+            self.network = VONet(patches_per_image=self.M)
             self.network.load_state_dict(new_state_dict)
 
         else:
@@ -148,7 +148,7 @@ class DPVO:
 
     @property
     def gmap(self):
-        return self.gmap_.view(1, self.mem * self.M, 128, 3, 3)
+        return self.gmap_.view(1, self.mem * self.M, FMAP_DIM, 3, 3)
 
     def get_pose(self, t):
         if t in self.traj:

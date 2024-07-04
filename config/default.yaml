@@ -1,7 +1,7 @@
 ### DPVO Config File ###
 
 # VO config (increase for better accuracy)
-PATCHES_PER_FRAME: 96
+PATCHES_PER_FRAME: 80
 REMOVAL_WINDOW: 22
 OPTIMIZATION_WINDOW: 10
 PATCH_LIFETIME: 13

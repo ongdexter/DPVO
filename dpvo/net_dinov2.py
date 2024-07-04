@@ -24,7 +24,13 @@ import matplotlib.pyplot as plt
 
 from transformers import Dinov2Backbone
 
+import torchvision.transforms as T
+
 DIM = 384
+
+image_transforms = T.Compose([
+    T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+])
 
 class Update(nn.Module):
     def __init__(self, p):
@@ -93,13 +99,56 @@ class Update(nn.Module):
 
         return net, (self.d(net), self.w(net), None)
 
+class Scorer(nn.Module):
+    def __init__(self, bins=512, patches_per_image=80) -> None:
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),            
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 1, kernel_size=3, padding=1),
+            nn.MaxPool2d(kernel_size=4, stride=4))
+    
+    def forward(self, x):
+        b, n, c1, h1, w1 = x.shape
+        x = x.view(b*n, c1, h1, w1)
+        scores = self.enc(x)
+        scores = F.interpolate(scores, size=(h1, w1), mode='bilinear')
+        
+        _, c2, h2, w2 = scores.shape
+        return scores.view(b, n, h2, w2)
+
 class Patchifier(nn.Module):
-    def __init__(self, patch_size=3, patches_per_image=80):
+    def __init__(self, patch_size=3, fmap_dim=128, patches_per_image=80):
         super(Patchifier, self).__init__()
         self.patch_size = patch_size
-        self.fnet = BasicEncoder4(output_dim=64, norm_fn='instance')
+        self.fmap_dim = fmap_dim
+        self.fnet = BasicEncoder4(output_dim=128, norm_fn='instance')
+        # self.dinov2 = Dinov2Backbone.from_pretrained("facebook/dinov2-small", out_indices=[-1]).cuda().eval()
+        # # print layers in dinov2
+        # for name, param in self.dinov2.named_parameters():
+        #     if 'encoder.layer.9' in name or 'encoder.layer.10' in name or 'encoder.layer.11' in name:
+        #         param.requires_grad = True
+        #     else:
+        #         param.requires_grad = False
+        # self.upsampler = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=True).cuda().eval()
         self.inet = BasicEncoder4(output_dim=DIM, norm_fn='none')
-        self.dinov2 = Dinov2Backbone.from_pretrained("facebook/dinov2-small", out_indices=[-1]).cuda().eval()
+        
+        # self.conv1 = torch.nn.Conv2d(384, 384, 3, 1, 1).cuda()
+        # self.conv2 = torch.nn.Conv2d(384, 384, 3, 1, 1).cuda()
+        
+        # self.conv3 = torch.nn.Conv2d(384, 128, 3, 1, 1).cuda()
+        # self.conv4 = torch.nn.Conv2d(128, 64, 3, 1, 1).cuda()
+        
+        # self.norm = torch.nn.InstanceNorm2d(384).cuda()
+        # self.relu = torch.nn.ReLU().cuda()
+        
+        self.scorer = Scorer(384)
+        
+        self.xfeat = torch.hub.load('verlab/accelerated_features', 'XFeat', pretrained = True, top_k = 80)
 
     def __image_gradient(self, images):
         gray = ((images + 0.5) * (255.0 / 2)).sum(dim=2)
@@ -109,77 +158,102 @@ class Patchifier(nn.Module):
         g = F.avg_pool2d(g, 4, 4)
         return g
     
-    def positional_encoding(self, x, num_frequencies=8):
-        results = []
-        for i in range(num_frequencies):
-            results.append(torch.sin(2**i * np.pi * x))
-            results.append(torch.cos(2**i * np.pi * x))
-        return torch.cat(results, dim=-1)
+    def get_top_n_coordinates(self, score_maps, top_n):
+        b, num_maps, height, width = score_maps.shape
+        grid_size = 10
+        cell_height = height // grid_size
+        cell_width = width // grid_size
 
-    def get_positional_encoding_features(self, images, num_patches=14):
-        b, n, c, h, w = images.shape
-        # # 14 x 14 image patches
-        # pixels_per_patch_x = w // num_patches
-        # pixels_per_patch_y = h // num_patches
-        # x_local = np.tile(np.arange(pixels_per_patch_x), num_patches)
-        # y_local = np.tile(np.arange(pixels_per_patch_y), num_patches)        
+        x_coords = torch.zeros((b, num_maps, top_n), dtype=torch.long)
+        y_coords = torch.zeros((b, num_maps, top_n), dtype=torch.long)
 
-        x_global = np.arange(w)
-        y_global = np.arange(h)
-        xs_global, ys_global = np.meshgrid(x_global, y_global)
-        
-        # x_local = np.pad(x_local, 5, mode='constant', constant_values=0)
-        # y_local= np.pad(y_local, 2, mode='constant', constant_values=0)
-        # xs_local, ys_local = np.meshgrid(x_local, y_local)
-        
-        # # print(xs_local.shape, ys_local.shape)
-        # # print(xs_global.shape, ys_global.shape)
-        
-        # # positional encoding for local coordinates
-        # x_local = torch.tensor(xs_local, dtype=torch.float32)
-        # y_local = torch.tensor(ys_local, dtype=torch.float32)
-        # x_local = x_local.reshape(-1)
-        # y_local = y_local.reshape(-1)
-        # coords_local = torch.stack([x_local, y_local], dim=-1)
-        # coords_local = self.positional_encoding(coords_local, num_frequencies=8)
+        for batch_idx in range(b):
+            for map_idx in range(num_maps):
+                top_coordinates = []
+                for i in range(grid_size):
+                    for j in range(grid_size):
+                        cell_scores = score_maps[batch_idx, map_idx, i*cell_height:(i+1)*cell_height, j*cell_width:(j+1)*cell_width]
+                        max_score_idx = torch.argmax(cell_scores).item()
+                        max_score_coords = (max_score_idx // cell_scores.shape[1], max_score_idx % cell_scores.shape[1])
+                        global_coords = (i*cell_height + max_score_coords[0], j*cell_width + max_score_coords[1])
+                        
+                        global_coords = (min(max(global_coords[0], 1), height-2), min(max(global_coords[1], 1), width-2))
+                        top_coordinates.append((global_coords, score_maps[batch_idx, map_idx, global_coords[0], global_coords[1]].item()))
 
-        # positional encoding for global coordinates
-        x_global = torch.tensor(xs_global, dtype=torch.float32)
-        y_global = torch.tensor(ys_global, dtype=torch.float32)
-        x_global = x_global.reshape(-1)
-        y_global = y_global.reshape(-1)
-        coords_global = torch.stack([x_global, y_global], dim=-1)
-        coords_global = self.positional_encoding(coords_global, num_frequencies=8)
+                top_coordinates = sorted(top_coordinates, key=lambda x: x[1], reverse=True)
 
-        # coords_encoded = torch.cat([coords_local, coords_global], dim=-1)
-        # coords_encoded = coords_encoded.reshape(h, w, -1).permute(2, 0, 1)
-        coords_encoded = coords_global.reshape(h, w, -1).permute(2, 0, 1)
-        
-        # repeat for b and n
-        coords_encoded = coords_encoded.unsqueeze(0).repeat(b*n, 1, 1, 1)
-        
-        return coords_encoded
+                top_n_coordinates = top_coordinates[:top_n]
+
+                for idx, coord in enumerate(top_n_coordinates):
+                    x_coords[batch_idx, map_idx, idx] = coord[0][0]
+                    y_coords[batch_idx, map_idx, idx] = coord[0][1]
+
+        return x_coords, y_coords
 
     def forward(self, images, patches_per_image=80, disps=None, gradient_bias=False, return_color=False):
         """ extract patches from input images """
         fmap = self.fnet(images) / 4.0
         imap = self.inet(images) / 4.0
-
-        b, n, c, h, w = imap.shape
-        P = self.patch_size
         
-        FMAP_DIM = 480
+        # dinov2
+        b, n, c1, h1, w1 = images.shape
         
+        mode = 'scorer' #  featup, pos_enc, dinov2    
+    
         with torch.no_grad():
-            b1, n1, c1, h1, w1 = images.shape
-            dinov2_features = self.dinov2(images.reshape(b1*n1, c1, h1, w1)).feature_maps[-1]
-            dinov2_features = F.interpolate(dinov2_features, size=(imap.shape[-2], imap.shape[-1]), mode='bilinear')
-            dinov2_features = dinov2_features.reshape(b, n, 384, imap.shape[-2], imap.shape[-1])
-            pos_features = self.get_positional_encoding_features(images)
-            pos_features = F.interpolate(pos_features, size=(imap.shape[-2], imap.shape[-1]), mode='bilinear')
-            pos_features = pos_features.reshape(b, n, 32, imap.shape[-2], imap.shape[-1]).cuda()
-            dinov2_features = torch.cat([dinov2_features, pos_features], dim=2)
-        fmap = torch.cat([fmap, dinov2_features], dim=2)
+            dinov2_features = self.dinov2(images.reshape(b*n, c1, h1, w1)).feature_maps[-1]
+            dinov2_features = F.interpolate(dinov2_features, size=(fmap.shape[-2], fmap.shape[-1]), mode='bilinear')
+            dinov2_features = dinov2_features.reshape(b, n, 384, fmap.shape[-2], fmap.shape[-1])
+        
+        if mode == 'scorer':
+            select_features = torch.cat([fmap, dinov2_features], dim=2)
+            scores = self.scorer(select_features)
+        
+        elif mode == 'dinov2':
+            fmap = F.interpolate(dinov2_features, size=(h1//4, w1//4), mode='bilinear')
+            _, c2, h2, w2 = fmap.shape
+            fmap = fmap.reshape(b, n, c2, h2, w2)
+            imap = F.interpolate(dinov2_features, size=(h1//4, w1//4), mode='bilinear')
+            _, c2, h2, w2 = imap.shape
+            imap = imap.reshape(b, n, c2, h2, w2)
+        
+            # imap
+            # imap = F.interpolate(dinov2_features, size=(h1//8, w1//8), mode='bilinear')
+            # imap = self.conv1(imap)
+            # imap = self.relu(imap)
+            # imap = F.interpolate(imap, size=(h1//4, w1//4), mode='bilinear')
+            # imap = self.conv2(imap)
+            # _, c2, h2, w2 = imap.shape
+            # imap = imap.reshape(b, n, c2, h2, w2)
+            
+            # fmap
+            # fmap = self.fnet(images)
+            
+            # fmap = F.interpolate(dinov2_features, size=(h1//8, w1//8), mode='bilinear')
+            # fmap = self.conv3(fmap)
+            # fmap = self.norm(fmap) # instance norm
+            # fmap = self.relu(fmap)
+            # fmap = F.interpolate(fmap, size=(h1//4, w1//4), mode='bilinear')
+            # fmap = self.conv4(fmap)
+            # _, c2, h2, w2 = fmap.shape
+            # fmap_dino = fmap.reshape(b, n, c2, h2, w2)
+                
+            # fmap = self.fnet(images)
+            # fmap = torch.cat([fmap_enc, fmap_dino], dim=2)
+        
+        elif mode == 'featup':
+            with torch.no_grad():
+                # resize to multiple of 14
+                transform = T.Compose([
+                    T.Resize(((h1//14*7), ((w1//14-1)*7)))
+                ])
+                dinov2_features = self.upsampler(transform(images.reshape(b*n, c1, h1, w1)))
+                dinov2_features = F.interpolate(dinov2_features, size=(h1//4, w1//4), mode='bilinear')
+                _, c2, h2, w2 = dinov2_features.shape
+                fmap = dinov2_features.reshape(b, n, c2, h2, w2)
+
+        b, n, c, h, w = fmap.shape
+        P = self.patch_size
 
         # bias patch selection towards regions with high gradient
         if gradient_bias:
@@ -195,12 +269,17 @@ class Patchifier(nn.Module):
             y = torch.gather(y, 1, ix[:, -patches_per_image:])
 
         else:
-            x = torch.randint(1, w-1, size=[n, patches_per_image], device="cuda")
-            y = torch.randint(1, h-1, size=[n, patches_per_image], device="cuda")
+            if mode == 'random':
+                x = torch.randint(1, w-1, size=[n, patches_per_image], device="cuda")
+                y = torch.randint(1, h-1, size=[n, patches_per_image], device="cuda")
+            elif mode == 'scorer':
+                x, y = self.get_top_n_coordinates(scores, patches_per_image)
+                x = x.squeeze(0)
+                y = y.squeeze(0)
         
         coords = torch.stack([x, y], dim=-1).float()
         imap = altcorr.patchify(imap[0], coords, 0).view(b, -1, DIM, 1, 1)
-        gmap = altcorr.patchify(fmap[0], coords, P//2).view(b, -1, FMAP_DIM, P, P)
+        gmap = altcorr.patchify(fmap[0], coords, P//2).view(b, -1, self.fmap_dim, P, P)
 
         if return_color:
             clr = altcorr.patchify(images[0], 4*(coords + 0.5), 0).view(b, -1, 3)
@@ -237,10 +316,12 @@ class CorrBlock:
 
 
 class VONet(nn.Module):
-    def __init__(self, use_viewer=False, patches_per_image=80):
+    def __init__(self, fmap_dim=128, patches_per_image=80, use_viewer=False):
         super(VONet, self).__init__()
         self.P = 3
-        self.patchify = Patchifier(self.P, patches_per_image=patches_per_image)
+        self.fmap_dim = fmap_dim
+        self.patches_per_image = patches_per_image
+        self.patchify = Patchifier(self.P, self.fmap_dim, self.patches_per_image)
         self.update = Update(self.P)
 
         self.DIM = DIM
@@ -250,8 +331,8 @@ class VONet(nn.Module):
     @autocast(enabled=False)
     def forward(self, images, poses, disps, intrinsics, M=1024, STEPS=12, P=1, structure_only=False, rescale=False):
         """ Estimates SE3 or Sim3 between pair of frames """
-
-        images = 2 * (images / 255.0) - 0.5
+        # images = 2 * (images / 255.0) - 0.5
+        images = image_transforms(images.float().cuda())
         intrinsics = intrinsics / 4.0
         disps = disps[:, :, 1::4, 1::4].float()
 
